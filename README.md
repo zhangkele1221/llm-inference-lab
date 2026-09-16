@@ -20,8 +20,8 @@ EngineCore.step()          ← 本仓库同名类，对应 vllm/v1/engine/core.p
 把 GitHub 链接里的 `github.com` 换成 `colab.research.google.com/github` 即可直接加载：
 
 ```
-原始链接： https://github.com/<你的用户名>/llm-inference-lab/blob/main/notebooks/01_env_and_benchmark.ipynb
-Colab 版：  https://colab.research.google.com/github/<你的用户名>/llm-inference-lab/blob/main/notebooks/01_env_and_benchmark.ipynb
+原始链接： https://github.com/zhangkele1221/llm-inference-lab/blob/main/notebooks/01_env_and_benchmark.ipynb
+Colab 版：  https://colab.research.google.com/github/zhangkele1221/llm-inference-lab/blob/main/notebooks/01_env_and_benchmark.ipynb
 ```
 
 **两个前提：**
@@ -78,7 +78,7 @@ Colab 版：  https://colab.research.google.com/github/<你的用户名>/llm-inf
 ## 四、本地运行
 
 ```bash
-git clone https://github.com/<你的用户名>/llm-inference-lab.git
+git clone https://github.com/zhangkele1221/llm-inference-lab.git
 cd llm-inference-lab
 pip install -r requirements.txt
 jupyter lab notebooks/
