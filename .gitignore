@@ -1,0 +1,27 @@
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 数据与模型（体积大，不进仓库）
+data/
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# 实验产物
+results/
+*.log
+
+# 系统
+.DS_Store
+.idea/
+.vscode/

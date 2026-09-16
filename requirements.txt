@@ -1,0 +1,11 @@
+# 第 01-08 章只需要这两个（Colab 已预装 torch）
+torch>=2.1
+numpy>=1.24
+
+# 第 09、10 章需要。vLLM 体积较大（约 2GB），建议用时再单独安装：
+#   !pip install vllm
+# vllm>=0.6.0
+# transformers>=4.40.0
+
+# 绘图（可选，用于实验可视化）
+# matplotlib>=3.7
