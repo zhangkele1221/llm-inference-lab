@@ -22,6 +22,8 @@ print(f"参数量 {model.n_params / 1e6:.1f}M，前缀 {PREFIX_LEN} token，后�
 # ## 一、副本：带前缀缓存的推理实例
 #
 # 每个副本有自己的显存预算（以能缓存的 token 数计）和一套 LRU 前缀缓存。
+#
+# > 这里的 `Replica` 相当于把第 04、05 章的 `EngineCore` + `KVCacheManager` 打包成一个可独立服务的实例。真实系统里每个副本就是一个独立的 vLLM 进程，本章用同一个模型对象模拟多个副本，是为了让单卡也能跑。
 # %%
 class Replica:
     def __init__(self, rid, model, capacity_tokens):

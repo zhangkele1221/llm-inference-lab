@@ -37,6 +37,13 @@ SETUP_CODE = r'''
 # 说明：本单元在每个 notebook 里都有一份完整副本，目的是让任何一个 notebook
 #       都能在 Colab 里零配置独立运行。想改模型结构，请改 tools/build_notebooks.py
 #       里的 SETUP_CODE，然后重跑编译脚本。
+#
+# 架构对齐：下面这套推理核心刻意模仿了 vLLM V1 的模块划分与命名，
+#   详见 docs/vllm-mapping.md 的对照表。
+#       EngineCore.step()           ←→ vllm/v1/engine/core.py
+#         ├─ Scheduler.schedule()   ←→ vllm/v1/core/sched/scheduler.py
+#         ├─ ModelRunner.execute_model() ←→ vllm/v1/worker/gpu_model_runner.py
+#         └─ Scheduler.update_from_output()
 import math
 import time
 
@@ -238,6 +245,269 @@ def generate_cached(model, idx, max_new_tokens):
 def kv_bytes(n_layer, n_kv_head, head_dim, seq_len, batch=1, dtype_bytes=2):
     """KV cache 字节数。注意是 2（K 和 V 各一份）。"""
     return 2 * n_layer * n_kv_head * head_dim * seq_len * batch * dtype_bytes
+
+
+# ========== 以下是模仿 vLLM V1 架构的推理核心 ==========
+
+
+class Request:
+    """对应 vllm/v1/request.py 的 Request。
+
+    num_computed_tokens 是 vLLM 里最核心的一个字段：它记录这条请求已经有
+    多少 token 的 KV 被算过。prefill、chunked prefill、前缀缓存命中——
+    三种看起来完全不同的场景，在 vLLM 里都只是「把 num_computed_tokens 往前推」。
+    理解这一点，chunked prefill 就不再是独立机制，而是这个字段的自然结果。
+    """
+
+    def __init__(self, request_id, prompt_token_ids, max_tokens):
+        self.request_id = request_id
+        self.prompt_token_ids = list(prompt_token_ids)
+        self.max_tokens = max_tokens
+        self.output_token_ids = []
+        self.num_computed_tokens = 0
+        self.status = "waiting"      # waiting / running / finished
+        # 本仓库简化：直接把 KV 张量挂在请求上。
+        # 真实 vLLM 不这么做——请求只持有 block_table，物理 block 由 KVCacheManager 管（第 05 章）。
+        self.past = None
+
+    @property
+    def num_prompt_tokens(self):
+        return len(self.prompt_token_ids)
+
+    def all_token_ids(self):
+        return self.prompt_token_ids + self.output_token_ids
+
+    def num_tokens_to_schedule(self):
+        """还欠多少 token 没算：prefill 阶段是剩余 prompt 长度，decode 阶段是 1。"""
+        if self.num_computed_tokens < self.num_prompt_tokens:
+            return self.num_prompt_tokens - self.num_computed_tokens
+        return 1
+
+    @property
+    def is_finished(self):
+        return len(self.output_token_ids) >= self.max_tokens
+
+    def __repr__(self):
+        return (f"Request({self.request_id}, computed={self.num_computed_tokens}"
+                f"/{self.num_prompt_tokens}, out={len(self.output_token_ids)}"
+                f"/{self.max_tokens}, {self.status})")
+
+
+class SchedulerOutput:
+    """对应 vllm/v1/core/sched/output.py 的 SchedulerOutput。
+
+    调度与执行之间唯一的接口。真实 vLLM 里这个结构还包含 block 分配结果、
+    抢占列表等字段，这里只保留最必要的两个。
+    """
+
+    def __init__(self, scheduled_reqs, num_scheduled_tokens):
+        self.scheduled_reqs = scheduled_reqs
+        self.num_scheduled_tokens = num_scheduled_tokens   # {request_id: n}
+
+    def __len__(self):
+        return len(self.scheduled_reqs)
+
+
+class Scheduler:
+    """对应 vllm/v1/core/sched/scheduler.py 的 Scheduler。
+
+    职责边界是这个架构里最值得学的一点：Scheduler 只决定
+    「这一轮跑哪些请求、各自跑几个 token」，它既不碰显存也不碰模型。
+
+        显存分配 → KVCacheManager（第 05 章）
+        真正计算 → ModelRunner
+
+    三个模块分离，才能各自独立替换实现。面试被问「说说 vLLM 的架构」时，
+    先把这个职责划分讲清楚，比背模块名有用得多。
+    """
+
+    def __init__(self, max_num_seqs=8, max_num_batched_tokens=2048):
+        self.waiting = []
+        self.running = []
+        self.finished = []
+        self.max_num_seqs = max_num_seqs
+        # 这个预算就是 chunked prefill 的开关：调小它，长 prompt 自然被切成多轮（第 06 章）
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.step_id = 0
+
+    def add_request(self, req):
+        self.waiting.append(req)
+
+    def has_unfinished(self):
+        return bool(self.waiting or self.running)
+
+    def schedule(self):
+        scheduled, num_tokens = [], {}
+        budget = self.max_num_batched_tokens
+
+        # 第一优先：正在跑的请求。已进 decode 的排 1 个 token；
+        # 还在做 chunked prefill 的按剩余量排，但受 budget 限制。
+        for req in list(self.running):
+            if budget <= 0 or len(scheduled) >= self.max_num_seqs:
+                break
+            n = min(req.num_tokens_to_schedule(), budget)
+            scheduled.append(req)
+            num_tokens[req.request_id] = n
+            budget -= n
+
+        # 第二优先：从队列里补新请求进来做 prefill
+        for req in list(self.waiting):
+            if budget <= 0 or len(scheduled) >= self.max_num_seqs:
+                break
+            n = min(req.num_tokens_to_schedule(), budget)
+            scheduled.append(req)
+            num_tokens[req.request_id] = n
+            budget -= n
+            self.waiting.remove(req)
+            req.status = "running"
+            self.running.append(req)
+
+        self.step_id += 1
+        return SchedulerOutput(scheduled, num_tokens)
+
+    def update_from_output(self, sched_out, sampled):
+        """对应 vLLM 的 update_from_output：写回采样结果，处理完成与回收。
+
+        本轮被调度但没产生 token 的请求（比如 chunked prefill 的中间块）
+        不会出现在 sampled 里，它们保持 running，下一轮继续。
+        """
+        for req in sched_out.scheduled_reqs:
+            if req.request_id not in sampled:
+                continue
+            req.output_token_ids.append(sampled[req.request_id])
+            if req.is_finished:
+                req.status = "finished"
+                if req in self.running:
+                    self.running.remove(req)
+                self.finished.append(req)
+                req.past = None      # 简化回收；真实 vLLM 走 KVCacheManager.free()
+
+
+class ModelRunner:
+    """对应 vllm/v1/worker/gpu_model_runner.py 的 GPUModelRunner。
+
+    职责：把 Scheduler 排好的一批请求拼成一次前向，返回新采样的 token。
+
+    与真实 vLLM 的差距（要如实知道）：
+      · vLLM 用 block_table 让每条序列的 KV 物理上不连续，所以不需要填充；
+        这里用「右填充 + 逐序列掩码」对齐，会浪费显存——第 05 章解决。
+      · vLLM 会把 prefill 和 decode 混在同一个 batch 里跑；这里分成两组处理，
+        纯粹是为了让代码可读，结论不受影响。
+      · 输入准备、CUDA graph、attention metadata 这些都被省掉了。
+    """
+
+    def __init__(self, model):
+        self.model = model
+
+    @torch.no_grad()
+    def _run_decode_batch(self, reqs):
+        """把一批进度不同的 decode 请求拼成一次前向。"""
+        B = len(reqs)
+        lens = [r.num_computed_tokens for r in reqs]
+        Lmax = max(lens)
+        n_layer = self.model.cfg.n_layer
+
+        padded = []
+        for layer in range(n_layer):
+            ks, vs = [], []
+            for r in reqs:
+                k, v = r.past[layer]
+                pad = Lmax - k.size(2)
+                if pad:
+                    k = F.pad(k, (0, 0, 0, pad))
+                    v = F.pad(v, (0, 0, 0, pad))
+                ks.append(k)
+                vs.append(v)
+            padded.append((torch.cat(ks, 0), torch.cat(vs, 0)))
+
+        # 逐序列掩码：真实历史 [0, L_i) + 新 token 落在下标 Lmax
+        S = Lmax + 1
+        mask = torch.zeros(B, 1, 1, S, dtype=torch.bool, device=DEVICE)
+        for i, r in enumerate(reqs):
+            mask[i, 0, 0, : lens[i]] = True
+            mask[i, 0, 0, Lmax] = True
+
+        ids = torch.tensor([[r.all_token_ids()[r.num_computed_tokens]] for r in reqs],
+                           device=DEVICE)
+        pos = torch.tensor(lens, device=DEVICE)
+        logits, past = self.model(ids, past_kvs=padded, pos_offset=pos, attn_mask=mask)
+
+        sampled = {}
+        for i, r in enumerate(reqs):
+            rebuilt = []
+            for layer in range(n_layer):
+                k_all, v_all = past[layer]
+                k = torch.cat([k_all[i:i + 1, :, : lens[i]],
+                               k_all[i:i + 1, :, Lmax:Lmax + 1]], dim=2)
+                v = torch.cat([v_all[i:i + 1, :, : lens[i]],
+                               v_all[i:i + 1, :, Lmax:Lmax + 1]], dim=2)
+                rebuilt.append((k, v))
+            r.past = rebuilt
+            r.num_computed_tokens += 1
+            sampled[r.request_id] = int(logits[i, -1].argmax(-1).item())
+        return sampled
+
+    @torch.no_grad()
+    def execute_model(self, sched_out):
+        decode_reqs, prefill_reqs = [], []
+        for r in sched_out.scheduled_reqs:
+            # 判断依据是「prompt 算完了没有」，而不是「本轮排了几个 token」
+            if r.num_computed_tokens >= r.num_prompt_tokens:
+                decode_reqs.append(r)
+            else:
+                prefill_reqs.append(r)
+
+        sampled = {}
+        if decode_reqs:
+            sampled.update(self._run_decode_batch(decode_reqs))
+
+        for r in prefill_reqs:
+            n = sched_out.num_scheduled_tokens[r.request_id]
+            start = r.num_computed_tokens
+            chunk = r.all_token_ids()[start:start + n]
+            toks = torch.tensor([chunk], device=DEVICE)
+            logits, past = self.model(toks, past_kvs=r.past, pos_offset=start)
+            r.past = past
+            r.num_computed_tokens += len(chunk)
+            # 只有 prompt 全部算完，才能采样第一个输出 token
+            if r.num_computed_tokens >= r.num_prompt_tokens:
+                sampled[r.request_id] = int(logits[:, -1].argmax(-1).item())
+        return sampled
+
+
+class EngineCore:
+    """对应 vllm/v1/engine/core.py 的 EngineCore。
+
+    整个 vLLM 的推理服务就跑在这三步上：
+
+        schedule()            决定这一轮跑什么
+        execute_model()       跑模型
+        update_from_output()  把结果写回请求状态
+
+    读懂这个循环你就抓住了 vLLM 的主干。后面所有优化——chunked prefill、
+    前缀缓存、抢占、投机解码——都是在这三步里插桩。
+    """
+
+    def __init__(self, model, scheduler=None):
+        self.scheduler = scheduler or Scheduler()
+        self.runner = ModelRunner(model)
+        self.step_id = 0
+        self.steps = 0
+
+    def step(self):
+        sched_out = self.scheduler.schedule()
+        if len(sched_out) == 0:
+            return None
+        sampled = self.runner.execute_model(sched_out)
+        self.scheduler.update_from_output(sched_out, sampled)
+        self.step_id += 1
+        self.steps += 1
+        return sampled
+
+    def run(self, max_steps=10000):
+        while self.scheduler.has_unfinished() and self.steps < max_steps:
+            self.step()
+        return self.steps
 
 
 print(f"引导单元加载完成 | device={DEVICE} dtype={DTYPE} torch={torch.__version__}")
