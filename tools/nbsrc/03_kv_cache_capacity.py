@@ -10,6 +10,11 @@
 # %%
 # @@SETUP@@
 
+# %%
+# 本章的实验对象。第 01 章详细拆解过它的结构，这里直接建出来用。
+model = build_model()
+print(f"MiniGPT: {model.n_params / 1e6:.1f}M 参数")
+
 # %% [markdown]
 # ## 一、先建立代价直觉：KV cache 省了多少计算
 #

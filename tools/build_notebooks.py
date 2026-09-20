@@ -56,6 +56,41 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # MiniGPT 只有 2700 万参数，用 float16 跑在 GPU 上；CPU 上 float16 很慢，用 float32
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
+# 常见卡的关键参数（近似值）。如果你的卡不在表里，直接在这里补一行：
+#   "你的卡型号": {"mem_gb": .., "bw_gbps": .., "fp16_tflops": .., "arch": ".."},
+# 三个数字都能在厂商 datasheet 上查到。第 02、03 章会用到它们。
+CARD_SPECS = {
+    "Tesla T4":        {"mem_gb": 16, "bw_gbps": 320,  "fp16_tflops": 65,  "arch": "Turing sm75"},
+    "Tesla V100":      {"mem_gb": 16, "bw_gbps": 900,  "fp16_tflops": 125, "arch": "Volta sm70"},
+    "A100-SXM4-40GB":  {"mem_gb": 40, "bw_gbps": 1555, "fp16_tflops": 312, "arch": "Ampere sm80"},
+    "A100-SXM4-80GB":  {"mem_gb": 80, "bw_gbps": 2039, "fp16_tflops": 312, "arch": "Ampere sm80"},
+    "L4":              {"mem_gb": 24, "bw_gbps": 300,  "fp16_tflops": 121, "arch": "Ada sm89"},
+    "A10G":            {"mem_gb": 24, "bw_gbps": 600,  "fp16_tflops": 125, "arch": "Ampere sm86"},
+    "H100 PCIe":       {"mem_gb": 80, "bw_gbps": 2000, "fp16_tflops": 756, "arch": "Hopper sm90"},
+    "H100 80GB HBM3":  {"mem_gb": 80, "bw_gbps": 3350, "fp16_tflops": 989, "arch": "Hopper sm90"},
+}
+
+
+def lookup_card():
+    """按 GPU 名称匹配规格表。匹配不到就返回零值，提醒你手工补。"""
+    if not torch.cuda.is_available():
+        return {"name": "CPU", "mem_gb": 0, "bw_gbps": 0, "fp16_tflops": 0, "arch": "CPU"}
+    name = torch.cuda.get_device_properties(0).name
+    for key, spec in CARD_SPECS.items():
+        # 双向包含匹配：Colab 可能报 "Tesla T4"，也可能报 "NVIDIA L4"
+        if key.lower() in name.lower() or name.lower().replace("nvidia ", "") in key.lower():
+            return {"name": name, **spec}
+    return {
+        "name": name,
+        "mem_gb": round(torch.cuda.get_device_properties(0).total_memory / 1024 ** 3, 1),
+        "bw_gbps": 0,
+        "fp16_tflops": 0,
+        "arch": "未知卡型 → 请查 datasheet 后补进 CARD_SPECS",
+    }
+
+
+SPEC = lookup_card()
+
 
 def sync():
     """GPU 是异步执行的，计时前必须同步，否则测到的是下发时间不是执行时间。"""

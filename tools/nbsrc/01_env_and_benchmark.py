@@ -38,7 +38,25 @@ else:
 !nvidia-smi
 
 # %% [markdown]
-# ## 一、把卡片的关键参数记下来
+# ## 一、引导单元：测量工具 + MiniGPT
+#
+# 下面这个单元格在每个 notebook 里都有一份完整副本，保证任何一章都能独立运行。
+#
+# 它包含五样东西：
+#
+# 1. **显卡规格 `CARD_SPECS` 和 `SPEC`**：你的卡有多少显存、多少带宽、多少算力。第 02、03 章直接拿它算账。
+# 2. `sync / bench / peak_mem_mb`：测量工具。GPU 是**异步执行**的，不调 `torch.cuda.synchronize()` 就计时，测到的是 kernel 下发时间而不是执行时间——这是新手最常犯的测量错误。
+# 3. `MiniGPT`：结构与 Llama 同源的因果语言模型，约 2700 万参数。
+# 4. `generate_naive / generate_cached`：两条生成路径，用来对比有无 KV cache。
+# 5. `kv_bytes`：KV cache 显存公式，第 03 章会实测验证它。
+#
+# **关于 MiniGPT 的一个重要设计**：它的 `forward` 接受 `pos_offset` 参数，允许 KV cache 从任意位置继续。这正是实现连续批处理的前提——不同请求处在不同位置，调度器必须能把它们拼进同一个 batch。
+
+# %%
+# @@SETUP@@
+
+# %% [markdown]
+# ## 二、你的卡是什么规格
 #
 # 后面每一章都要用这三个数字：
 #
@@ -50,42 +68,9 @@ else:
 #
 # 把「算力 ÷ 带宽」算出来，你就有了判断一个操作是 compute-bound 还是 memory-bound 的标尺。第 02 章会用到。
 #
-# > 下表是常见卡的近似规格（FP16 稠密算力，不含稀疏加速）。如果你用的卡不在表里，去厂商 datasheet 查三个数字补进来即可。
+# > 表里是常见卡的近似规格（FP16 稠密算力，不含稀疏加速）。**你的卡不在表里的话，直接在上面那个引导单元里补一行**，三个数字在厂商 datasheet 上都能查到。
 
 # %%
-CARD_SPECS = {
-    "Tesla T4":              {"mem_gb": 16, "bw_gbps": 320,  "fp16_tflops": 65,  "arch": "Turing sm75"},
-    "Tesla V100":            {"mem_gb": 16, "bw_gbps": 900,  "fp16_tflops": 125, "arch": "Volta sm70"},
-    "A100-SXM4-40GB":        {"mem_gb": 40, "bw_gbps": 1555, "fp16_tflops": 312, "arch": "Ampere sm80"},
-    "A100-SXM4-80GB":        {"mem_gb": 80, "bw_gbps": 2039, "fp16_tflops": 312, "arch": "Ampere sm80"},
-    "L4":                    {"mem_gb": 24, "bw_gbps": 300,  "fp16_tflops": 121, "arch": "Ada sm89"},
-    "A10G":                  {"mem_gb": 24, "bw_gbps": 600,  "fp16_tflops": 125, "arch": "Ampere sm86"},
-    "H100 PCIe":             {"mem_gb": 80, "bw_gbps": 2000, "fp16_tflops": 756, "arch": "Hopper sm90"},
-    "H100 80GB HBM3":        {"mem_gb": 80, "bw_gbps": 3350, "fp16_tflops": 989, "arch": "Hopper sm90"},
-}
-
-
-def lookup_card():
-    """按 GPU 名称匹配规格表。匹配不到就返回零值，提醒你手工补。"""
-    if not torch.cuda.is_available():
-        return {"name": "CPU", "mem_gb": 0, "bw_gbps": 0, "fp16_tflops": 0, "arch": "CPU"}
-
-    name = torch.cuda.get_device_properties(0).name
-    for key, spec in CARD_SPECS.items():
-        # 双向包含匹配：Colab 可能报 "Tesla T4"，也可能报 "NVIDIA L4"
-        if key.lower() in name.lower() or name.lower().replace("nvidia ", "") in key.lower():
-            return {"name": name, **spec}
-
-    return {
-        "name": name,
-        "mem_gb": round(torch.cuda.get_device_properties(0).total_memory / 1024 ** 3, 1),
-        "bw_gbps": 0,
-        "fp16_tflops": 0,
-        "arch": "未知卡型 → 请查 datasheet 后补进 CARD_SPECS",
-    }
-
-
-SPEC = lookup_card()
 for k, v in SPEC.items():
     print(f"{k:12s}: {v}")
 
@@ -93,23 +78,6 @@ if SPEC["bw_gbps"]:
     ratio = SPEC["fp16_tflops"] * 1e12 / (SPEC["bw_gbps"] * 1e9)
     print(f"\n算力/带宽比 = {ratio:.0f} FLOP/byte")
     print("→ 记住这个数，第 02 章用它判断 prefill 和 decode 各自的瓶颈。")
-
-# %% [markdown]
-# ## 二、引导单元：测量工具 + MiniGPT
-#
-# 下面这个单元格在每个 notebook 里都有一份完整副本，保证任何一章都能独立运行。
-#
-# 它包含四样东西：
-#
-# 1. `sync / bench / peak_mem_mb`：测量工具。GPU 是**异步执行**的，不调 `torch.cuda.synchronize()` 就计时，测到的是 kernel 下发时间而不是执行时间——这是新手最常犯的测量错误。
-# 2. `MiniGPT`：一个结构与 Llama 同源的因果语言模型，约 2700 万参数。
-# 3. `generate_naive / generate_cached`：两条生成路径，用来对比有无 KV cache。
-# 4. `kv_bytes`：KV cache 显存公式，第 03 章会实测验证它。
-#
-# **关于 MiniGPT 的一个重要设计**：它的 `forward` 接受 `pos_offset` 参数，允许 KV cache 从任意位置继续。这正是实现连续批处理的前提——不同请求处在不同位置，调度器必须能把它们拼进同一个 batch。
-
-# %%
-# @@SETUP@@
 
 # %% [markdown]
 # ## 三、认识你的实验对象
