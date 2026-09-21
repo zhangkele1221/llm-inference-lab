@@ -284,7 +284,7 @@ for bid in shared[:4]:
 
 print(f"\n空闲 block 数: {pool.num_free}")
 print()
-print("引用计数是前缀共享能成立的关键：**多个请求读同一份物理块，谁都不复制**。")
+print("引用计数是前缀共享能成立的关键：多个请求读同一份物理块，谁都不复制。")
 print("一旦某条序列要往里写（分叉后产生新 token），就需要写时复制（COW）——")
 print("vLLM 里的做法是 block 被覆写前先从缓存哈希表里摘除。")
 # %% [markdown]
